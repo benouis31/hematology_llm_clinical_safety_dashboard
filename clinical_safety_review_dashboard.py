@@ -7,6 +7,7 @@ import streamlit as st
 import gspread
 
 from google.oauth2.service_account import Credentials
+import json
 
 
 # ============================================================
@@ -60,11 +61,9 @@ def get_sheet():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    service_account_info = dict(st.secrets["gcp_service_account"])
-
-    service_account_info["private_key"] = service_account_info[
-        "private_key"
-    ].replace("\\n", "\n")
+    service_account_info = json.loads(
+        st.secrets["gcp_service_account_json"]
+    )
 
     creds = Credentials.from_service_account_info(
         service_account_info,
