@@ -330,7 +330,30 @@ df["prediction"] = df["prediction"].apply(
 
 df["error_type"] = df["error_type"].astype(str)
 
+#annotations = load_annotations(reviewer_id)
+
+
 annotations = load_annotations(reviewer_id)
+
+# ============================================================
+# DOWNLOAD REVIEWER ANNOTATIONS
+# ============================================================
+
+reviewer_annotations = annotations[
+    annotations["reviewer_id"].astype(str)
+    == str(reviewer_id)
+]
+
+csv_export = reviewer_annotations.to_csv(index=False)
+
+st.sidebar.download_button(
+    label="Download my annotations",
+    data=csv_export,
+    file_name=f"{reviewer_id}_annotations.csv",
+    mime="text/csv",
+)
+
+
 
 
 # ============================================================
