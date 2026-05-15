@@ -1,0 +1,7 @@
+streamlit
+pandas
+python-docx
+streamlit
+pandas
+gspread
+google-auth
