@@ -62,10 +62,13 @@ def get_sheet():
     ]
 
     # Local credentials file
-    creds = Credentials.from_service_account_file(
-        "streamlit-dashboard-496414-351400f7b74c.json",
-        scopes=scopes,
-    )
+
+
+
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes,)
+
+    
+    #creds = Credentials.from_service_account_file("streamlit-dashboard-496414-351400f7b74c.json",scopes=scopes,)
 
     client = gspread.authorize(creds)
 
