@@ -53,7 +53,6 @@ st.success(
 # ============================================================
 # GOOGLE SHEETS CONNECTION
 # ============================================================
-
 @st.cache_resource
 def get_sheet():
     scopes = [
@@ -61,14 +60,16 @@ def get_sheet():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    # Local credentials file
+    service_account_info = dict(st.secrets["gcp_service_account"])
 
+    service_account_info["private_key"] = service_account_info[
+        "private_key"
+    ].replace("\\n", "\n")
 
-
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes,)
-
-    
-    #creds = Credentials.from_service_account_file("streamlit-dashboard-496414-351400f7b74c.json",scopes=scopes,)
+    creds = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=scopes,
+    )
 
     client = gspread.authorize(creds)
 
