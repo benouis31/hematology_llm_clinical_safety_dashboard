@@ -61,9 +61,7 @@ def get_sheet():
         "https://www.googleapis.com/auth/drive",
     ]
 
-    service_account_info = json.loads(
-        st.secrets["gcp_service_account_json"]
-    )
+    service_account_info = dict(st.secrets["gcp_service_account"])
 
     creds = Credentials.from_service_account_info(
         service_account_info,
