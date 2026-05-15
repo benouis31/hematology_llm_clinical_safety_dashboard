@@ -62,6 +62,9 @@ def get_sheet():
     ]
 
     service_account_info = dict(st.secrets["gcp_service_account"])
+    service_account_info["private_key"] = service_account_info[
+        "private_key"
+    ].replace("\\n", "\n")
 
     creds = Credentials.from_service_account_info(
         service_account_info,
