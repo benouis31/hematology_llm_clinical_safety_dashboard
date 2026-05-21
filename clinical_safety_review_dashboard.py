@@ -203,7 +203,6 @@ def load_annotations(reviewer_id: str) -> pd.DataFrame:
         df["reviewer_id"].astype(str) == str(reviewer_id)
     ].copy()
 
-
 def save_annotation(
     row,
     reviewer_id,
