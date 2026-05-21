@@ -117,34 +117,46 @@ def validate_data(df: pd.DataFrame):
         st.stop()
 
 
-def format_answer(answer) -> str:
-    """
-    Format an answer for display.
-    Handles '0', empty strings, and NaN safely.
-    """
+def clean_answer(answer) -> str:
+    """Normalize MCQ answers, preserving leading zeros and order."""
     if pd.isna(answer):
-        return "(missing)"
-    
+        return ""
+
     text = str(answer).strip()
-    
-    # Explicitly check for empty string after stripping
+
     if text == "":
-        return "(missing)"
-    
-    # Format space-separated for readability: "023" -> "0 2 3"
-    return " ".join(list(text))
+        return ""
+
+    digits = re.findall(r"\d", text)
+
+    if not digits:
+        return text
+
+    seen = set()
+    ordered_digits = []
+
+    for d in digits:
+        if d not in seen:
+            ordered_digits.append(d)
+            seen.add(d)
+
+    return "".join(ordered_digits)
 
 
 def format_answer(answer) -> str:
+    """Format answer for display, safely handling 0, empty, and NaN."""
     cleaned = clean_answer(answer)
 
     if cleaned == "":
         return "No answer"
 
-    if cleaned.isdigit():
+    if cleaned.isdigit() or (cleaned.startswith("0") and cleaned[1:].isdigit()):
         return " ".join(list(cleaned))
 
     return cleaned
+
+
+
 
 
 def safe_text(value) -> str:
