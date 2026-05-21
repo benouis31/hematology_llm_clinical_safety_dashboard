@@ -117,30 +117,22 @@ def validate_data(df: pd.DataFrame):
         st.stop()
 
 
-def clean_answer(answer) -> str:
+def format_answer(answer) -> str:
+    """
+    Format an answer for display.
+    Handles '0', empty strings, and NaN safely.
+    """
     if pd.isna(answer):
-        return ""
-
+        return "(missing)"
+    
     text = str(answer).strip()
-
+    
+    # Explicitly check for empty string after stripping
     if text == "":
-        return ""
-
-    try:
-        value = float(text)
-
-        if value.is_integer():
-            text = str(int(value))
-
-    except Exception:
-        pass
-
-    digits = re.findall(r"\d", text)
-
-    if not digits:
-        return text
-
-    return "".join(digits)
+        return "(missing)"
+    
+    # Format space-separated for readability: "023" -> "0 2 3"
+    return " ".join(list(text))
 
 
 def format_answer(answer) -> str:
