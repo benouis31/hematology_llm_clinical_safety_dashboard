@@ -1,13 +1,10 @@
-from pathlib import Path
 from datetime import datetime
 import re
 
 import pandas as pd
 import streamlit as st
 import gspread
-
 from google.oauth2.service_account import Credentials
-import json
 
 
 # ============================================================
@@ -54,6 +51,7 @@ st.success(
 # ============================================================
 # GOOGLE SHEETS CONNECTION
 # ============================================================
+
 @st.cache_resource
 def get_sheet():
     scopes = [
@@ -75,13 +73,13 @@ def get_sheet():
 
     return client.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
 
+
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     df.columns = df.columns.str.strip()
 
     rename_map = {
@@ -118,9 +116,19 @@ def validate_data(df: pd.DataFrame):
 
 
 def clean_answer(answer) -> str:
-    """Normalize MCQ answers, preserving leading zeros and order."""
-    if pd.isna(answer):
-        return ""
+    """
+    Normalize MCQ answers, preserving leading zeros and original order.
+    Examples:
+        3.0        -> "3"
+        "0 1 2 4"  -> "0124"
+        "[0,1,2]"  -> "012"
+        NaN        -> ""
+    """
+    try:
+        if pd.isna(answer):
+            return ""
+    except (TypeError, ValueError):
+        pass
 
     text = str(answer).strip()
 
@@ -132,9 +140,9 @@ def clean_answer(answer) -> str:
     if not digits:
         return text
 
+    # Remove duplicates while preserving order
     seen = set()
     ordered_digits = []
-
     for d in digits:
         if d not in seen:
             ordered_digits.append(d)
@@ -144,24 +152,31 @@ def clean_answer(answer) -> str:
 
 
 def format_answer(answer) -> str:
-    """Format answer for display, safely handling 0, empty, and NaN."""
+    """
+    Format a cleaned answer for display.
+    Handles "0", empty strings, and NaN safely.
+    Single digit "0" -> "0" (not empty / falsy).
+    Multi-digit "023" -> "0 2 3".
+    """
     cleaned = clean_answer(answer)
 
     if cleaned == "":
         return "No answer"
 
-    if cleaned.isdigit() or (cleaned.startswith("0") and cleaned[1:].isdigit()):
+    # All-digit strings (including those starting with 0)
+    if re.fullmatch(r"\d+", cleaned):
         return " ".join(list(cleaned))
 
     return cleaned
 
 
-
-
-
 def safe_text(value) -> str:
-    if pd.isna(value):
-        return ""
+    """Return clean display text, guarding against NaN and non-strings."""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
 
     return str(value).strip()
 
@@ -185,15 +200,14 @@ def empty_annotation_table() -> pd.DataFrame:
 
 
 def load_annotations(reviewer_id: str) -> pd.DataFrame:
+    """Load all annotations for a given reviewer from Google Sheets."""
     sheet = get_sheet()
-
     records = sheet.get_all_records()
 
     if not records:
         return empty_annotation_table()
 
     df = pd.DataFrame(records)
-
     df.columns = df.columns.str.strip()
 
     if "reviewer_id" not in df.columns:
@@ -203,6 +217,7 @@ def load_annotations(reviewer_id: str) -> pd.DataFrame:
         df["reviewer_id"].astype(str) == str(reviewer_id)
     ].copy()
 
+
 def save_annotation(
     row,
     reviewer_id,
@@ -211,15 +226,14 @@ def save_annotation(
     consensus,
     comment,
 ):
+    """Save or overwrite an annotation in Google Sheets."""
     sheet = get_sheet()
-
     records = sheet.get_all_records()
 
     row_exists = False
     existing_row_number = None
 
     for idx, record in enumerate(records, start=2):
-
         if (
             str(record.get("reviewer_id", "")) == str(reviewer_id)
             and str(record.get("QID", "")) == str(row["QID"])
@@ -230,7 +244,7 @@ def save_annotation(
             break
 
     new_row = [
-        reviewer_id,
+        str(reviewer_id),
         datetime.now().isoformat(timespec="seconds"),
         str(row["QID"]),
         str(row["model"]),
@@ -240,34 +254,18 @@ def save_annotation(
         safety_rating,
         str(bool(outdated)),
         str(bool(consensus)),
-        comment,
+        str(comment),
     ]
 
     if row_exists:
-
-        cell_range = (
-            f"A{existing_row_number}:K{existing_row_number}"
-        )
-
-        sheet.update(
-            cell_range,
-            [new_row],
-        )
-
+        cell_range = f"A{existing_row_number}:K{existing_row_number}"
+        sheet.update(cell_range, [new_row])
     else:
-
-        sheet.append_row(
-            new_row,
-            value_input_option="USER_ENTERED",
-        )
+        sheet.append_row(new_row, value_input_option="USER_ENTERED")
 
 
-def get_existing_annotation(
-    annotations,
-    reviewer_id,
-    qid,
-    model,
-):
+def get_existing_annotation(annotations, reviewer_id, qid, model):
+    """Retrieve the most recent annotation for a reviewer/QID/model."""
     if annotations.empty:
         return None
 
@@ -283,6 +281,20 @@ def get_existing_annotation(
     return subset.iloc[-1].to_dict()
 
 
+def get_active_reviewers() -> list:
+    """Return sorted list of all reviewers who have submitted annotations."""
+    sheet = get_sheet()
+    all_records = sheet.get_all_records()
+
+    return sorted(
+        set(
+            str(r.get("reviewer_id", ""))
+            for r in all_records
+            if str(r.get("reviewer_id", "")).strip()
+        )
+    )
+
+
 # ============================================================
 # SIDEBAR — SETUP
 # ============================================================
@@ -292,7 +304,7 @@ st.sidebar.header("Review Setup")
 reviewer_id = st.sidebar.text_input(
     "Reviewer ID",
     value="reviewer_1",
-    help="Use a unique blinded reviewer ID.",
+    help="Use a unique blinded reviewer ID, e.g. reviewer_freya.",
 )
 
 uploaded_file = st.sidebar.file_uploader(
@@ -313,41 +325,24 @@ if uploaded_file is None:
 # LOAD DATA
 # ============================================================
 
-df = pd.read_csv(uploaded_file)
-
+df = pd.read_csv(uploaded_file, dtype=str)
 df = normalize_columns(df)
-
 validate_data(df)
 
 df["QID"] = df["QID"].astype(str)
-
 df["model"] = df["model"].astype(str)
-
-df["ground_truth"] = df["ground_truth"].apply(
-    clean_answer
-)
-
-df["prediction"] = df["prediction"].apply(
-    clean_answer
-)
-
+df["ground_truth"] = df["ground_truth"].apply(clean_answer)
+df["prediction"] = df["prediction"].apply(clean_answer)
 df["error_type"] = df["error_type"].astype(str)
 
-#annotations = load_annotations(reviewer_id)
-
-
 annotations = load_annotations(reviewer_id)
+
 
 # ============================================================
 # DOWNLOAD REVIEWER ANNOTATIONS
 # ============================================================
 
-reviewer_annotations = annotations[
-    annotations["reviewer_id"].astype(str)
-    == str(reviewer_id)
-]
-
-csv_export = reviewer_annotations.to_csv(index=False)
+csv_export = annotations.to_csv(index=False)
 
 st.sidebar.download_button(
     label="Download my annotations",
@@ -355,8 +350,6 @@ st.sidebar.download_button(
     file_name=f"{reviewer_id}_annotations.csv",
     mime="text/csv",
 )
-
-
 
 
 # ============================================================
@@ -371,7 +364,6 @@ reviewed_pairs = set(
 )
 
 total_pairs = len(df)
-
 reviewed_count = len(reviewed_pairs)
 
 st.sidebar.metric(
@@ -384,33 +376,16 @@ st.sidebar.metric(
 # REVIEWER ACTIVITY
 # ============================================================
 
-all_annotations = get_sheet().get_all_records()
-
-active_reviewers = sorted(
-    list(
-        set(
-            str(r.get("reviewer_id", ""))
-            for r in all_annotations
-            if str(r.get("reviewer_id", "")).strip()
-        )
-    )
-)
+active_reviewers = get_active_reviewers()
 
 st.sidebar.divider()
-
 st.sidebar.subheader("Reviewer activity")
-
-st.sidebar.write(
-    f"Active reviewers: {len(active_reviewers)}"
-)
+st.sidebar.write(f"Active reviewers: {len(active_reviewers)}")
 
 if active_reviewers:
-
     for reviewer in active_reviewers:
         st.sidebar.write(f"• {reviewer}")
-
 else:
-
     st.sidebar.info("No reviewer activity yet.")
 
 
@@ -428,9 +403,7 @@ selected_qid = st.sidebar.selectbox(
     question_ids,
 )
 
-current_df = df[
-    df["QID"] == selected_qid
-].copy()
+current_df = df[df["QID"] == selected_qid].copy()
 
 current_pairs = set(
     zip(
@@ -441,8 +414,7 @@ current_pairs = set(
 
 st.sidebar.write(
     f"Current question progress: "
-    f"{len(current_pairs & reviewed_pairs)} "
-    f"/ {len(current_pairs)}"
+    f"{len(current_pairs & reviewed_pairs)} / {len(current_pairs)}"
 )
 
 
@@ -466,51 +438,31 @@ with left:
     first = current_df.iloc[0]
 
     st.write("**Ground truth answer:**")
+    st.code(format_answer(first["ground_truth"]))
 
-    st.code(
-        format_answer(first["ground_truth"])
-    )
-
-    clinical_question = safe_text(
-        first.get("clinical_question", "")
-    )
-
-    options_sorted = safe_text(
-        first.get("options_sorted", "")
-    )
-
-    vignette = safe_text(
-        first.get("vignette", "")
-    )
-
-    full_prompt = safe_text(
-        first.get("full_prompt", "")
-    )
+    clinical_question = safe_text(first.get("clinical_question", ""))
+    options_sorted = safe_text(first.get("options_sorted", ""))
+    vignette = safe_text(first.get("vignette", ""))
+    full_prompt = safe_text(first.get("full_prompt", ""))
 
     if clinical_question:
-
         st.write("**Question:**")
-
         st.write(clinical_question)
+    else:
+        st.info("No separated clinical question available in this CSV.")
 
     if options_sorted:
-
         st.write("**Answer options:**")
-
         st.text(options_sorted)
+    else:
+        st.info("No sorted answer options available in this CSV.")
 
     if vignette:
-
-        with st.expander(
-            "Show clinical vignette"
-        ):
+        with st.expander("Show clinical vignette"):
             st.write(vignette)
 
     if full_prompt:
-
-        with st.expander(
-            "Show original prompt"
-        ):
+        with st.expander("Show original prompt"):
             st.write(full_prompt)
 
 
@@ -520,13 +472,9 @@ with left:
 
 with right:
 
-    st.markdown(
-        "### Model Output Safety Assessment"
-    )
+    st.markdown("### Model Output Safety Assessment")
 
-    for _, row in current_df.sort_values(
-        "model"
-    ).iterrows():
+    for _, row in current_df.sort_values("model").iterrows():
 
         existing = get_existing_annotation(
             annotations,
@@ -538,138 +486,75 @@ with right:
         default_rating = (
             existing["safety_rating"]
             if existing is not None
-            and existing.get(
-                "safety_rating"
-            ) in SAFETY_LABELS
+            and existing.get("safety_rating") in SAFETY_LABELS
             else SAFETY_LABELS[0]
         )
 
         default_outdated = (
-            str(
-                existing.get(
-                    "ground_truth_outdated",
-                    "False",
-                )
-            ).lower()
-            == "true"
+            str(existing.get("ground_truth_outdated", "False")).lower() == "true"
             if existing is not None
             else False
         )
 
         default_consensus = (
-            str(
-                existing.get(
-                    "needs_consensus_review",
-                    "False",
-                )
-            ).lower()
-            == "true"
+            str(existing.get("needs_consensus_review", "False")).lower() == "true"
             if existing is not None
             else False
         )
 
         default_comment = (
-            existing.get(
-                "clinician_comment",
-                "",
-            )
+            str(existing.get("clinician_comment", ""))
             if existing is not None
             else ""
         )
 
         with st.expander(
-            f"{row['model']} | "
-            f"Prediction: "
-            f"{format_answer(row['prediction'])}",
+            f"{row['model']} | Prediction: {format_answer(row['prediction'])}",
             expanded=True,
         ):
 
             st.write("**Model prediction:**")
-
-            st.code(
-                format_answer(
-                    row["prediction"]
-                )
-            )
+            st.code(format_answer(row["prediction"]))
 
             st.write("**Ground truth:**")
+            st.code(format_answer(row["ground_truth"]))
 
-            st.code(
-                format_answer(
-                    row["ground_truth"]
-                )
-            )
-
-            st.write(
-                "**Automatic failure type:**"
-            )
-
+            st.write("**Automatic failure type:**")
             st.write(row["error_type"])
 
             safety_rating = st.selectbox(
                 "Safety rating",
                 SAFETY_LABELS,
-                index=SAFETY_LABELS.index(
-                    default_rating
-                ),
-                key=(
-                    f"safety_"
-                    f"{row['QID']}_"
-                    f"{row['model']}"
-                ),
+                index=SAFETY_LABELS.index(default_rating),
+                key=f"safety_{row['QID']}_{row['model']}",
             )
 
             outdated = st.checkbox(
-                (
-                    "Ground truth may be "
-                    "outdated / "
-                    "model partially correct"
-                ),
+                "Ground truth may be outdated / model partially correct",
                 value=default_outdated,
-                key=(
-                    f"outdated_"
-                    f"{row['QID']}_"
-                    f"{row['model']}"
-                ),
+                key=f"outdated_{row['QID']}_{row['model']}",
             )
 
             consensus = st.checkbox(
                 "Needs consensus review",
                 value=default_consensus,
-                key=(
-                    f"consensus_"
-                    f"{row['QID']}_"
-                    f"{row['model']}"
-                ),
+                key=f"consensus_{row['QID']}_{row['model']}",
             )
 
             comment = st.text_area(
                 "Clinician comment",
                 value=default_comment,
-                key=(
-                    f"comment_"
-                    f"{row['QID']}_"
-                    f"{row['model']}"
-                ),
+                key=f"comment_{row['QID']}_{row['model']}",
                 placeholder=(
-                    "Explain potential "
-                    "patient harm, "
-                    "omitted action, "
-                    "harmful implementation, "
-                    "or outdated "
-                    "ground truth."
+                    "Explain potential patient harm, omitted action, "
+                    "harmful implementation, or outdated ground truth."
                 ),
             )
 
             if st.button(
                 "Save annotation",
-                key=(
-                    f"save_"
-                    f"{row['QID']}_"
-                    f"{row['model']}"
-                ),
+                key=f"save_{row['QID']}_{row['model']}",
             ):
-
                 save_annotation(
                     row=row,
                     reviewer_id=reviewer_id,
@@ -678,10 +563,4 @@ with right:
                     consensus=consensus,
                     comment=comment,
                 )
-
-                st.success(
-                    (
-                        "Annotation saved "
-                        "permanently."
-                    )
-                )
+                st.success("Annotation saved permanently.")
