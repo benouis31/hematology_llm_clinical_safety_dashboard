@@ -44,7 +44,8 @@ st.title("Clinical Safety Review Dashboard")
 st.caption("Blinded clinician review of LLM failures in hematology MCQs")
 
 st.success(
-    "Annotations are saved permanently after clicking 'Save annotation'."
+    "Annotations are saved automatically after each change. "
+    "You can also click 'Save annotation' manually."
 )
 
 
@@ -119,10 +120,10 @@ def clean_answer(answer) -> str:
     """
     Normalize MCQ answers, preserving leading zeros and original order.
     Examples:
-        3.0        -> "3"
-        "0 1 2 4"  -> "0124"
-        "[0,1,2]"  -> "012"
-        NaN        -> ""
+        3.0         -> "3"
+        "0 1 2 4"   -> "0124"
+        "[0,1,2]"   -> "012"
+        NaN         -> ""
     """
     try:
         if pd.isna(answer):
@@ -140,9 +141,9 @@ def clean_answer(answer) -> str:
     if not digits:
         return text
 
-    # Remove duplicates while preserving order
     seen = set()
     ordered_digits = []
+
     for d in digits:
         if d not in seen:
             ordered_digits.append(d)
@@ -155,7 +156,7 @@ def format_answer(answer) -> str:
     """
     Format a cleaned answer for display.
     Handles "0", empty strings, and NaN safely.
-    Single digit "0" -> "0" (not empty / falsy).
+    Single digit "0" -> "0".
     Multi-digit "023" -> "0 2 3".
     """
     cleaned = clean_answer(answer)
@@ -163,7 +164,6 @@ def format_answer(answer) -> str:
     if cleaned == "":
         return "No answer"
 
-    # All-digit strings (including those starting with 0)
     if re.fullmatch(r"\d+", cleaned):
         return " ".join(list(cleaned))
 
@@ -262,6 +262,36 @@ def save_annotation(
         sheet.update(cell_range, [new_row])
     else:
         sheet.append_row(new_row, value_input_option="USER_ENTERED")
+
+
+def autosave_annotation(
+    row,
+    reviewer_id,
+    safety_key,
+    outdated_key,
+    consensus_key,
+    comment_key,
+    saved_key,
+):
+    """
+    Autosave annotation whenever the reviewer changes an input.
+    This uses the existing Google Sheets save_annotation() function.
+    """
+    safety_rating = st.session_state.get(safety_key, SAFETY_LABELS[0])
+    outdated = st.session_state.get(outdated_key, False)
+    consensus = st.session_state.get(consensus_key, False)
+    comment = st.session_state.get(comment_key, "")
+
+    save_annotation(
+        row=row,
+        reviewer_id=reviewer_id,
+        safety_rating=safety_rating,
+        outdated=outdated,
+        consensus=consensus,
+        comment=comment,
+    )
+
+    st.session_state[saved_key] = datetime.now().strftime("%H:%M:%S")
 
 
 def get_existing_annotation(annotations, reviewer_id, qid, model):
@@ -522,34 +552,63 @@ with right:
             st.write("**Automatic failure type:**")
             st.write(row["error_type"])
 
+            row_data = row.to_dict()
+
+            safety_key = f"safety_{row['QID']}_{row['model']}"
+            outdated_key = f"outdated_{row['QID']}_{row['model']}"
+            consensus_key = f"consensus_{row['QID']}_{row['model']}"
+            comment_key = f"comment_{row['QID']}_{row['model']}"
+            saved_key = f"saved_{row['QID']}_{row['model']}"
+
+            autosave_args = (
+                row_data,
+                reviewer_id,
+                safety_key,
+                outdated_key,
+                consensus_key,
+                comment_key,
+                saved_key,
+            )
+
             safety_rating = st.selectbox(
                 "Safety rating",
                 SAFETY_LABELS,
                 index=SAFETY_LABELS.index(default_rating),
-                key=f"safety_{row['QID']}_{row['model']}",
+                key=safety_key,
+                on_change=autosave_annotation,
+                args=autosave_args,
             )
 
             outdated = st.checkbox(
                 "Ground truth may be outdated / model partially correct",
                 value=default_outdated,
-                key=f"outdated_{row['QID']}_{row['model']}",
+                key=outdated_key,
+                on_change=autosave_annotation,
+                args=autosave_args,
             )
 
             consensus = st.checkbox(
                 "Needs consensus review",
                 value=default_consensus,
-                key=f"consensus_{row['QID']}_{row['model']}",
+                key=consensus_key,
+                on_change=autosave_annotation,
+                args=autosave_args,
             )
 
             comment = st.text_area(
                 "Clinician comment",
                 value=default_comment,
-                key=f"comment_{row['QID']}_{row['model']}",
+                key=comment_key,
                 placeholder=(
                     "Explain potential patient harm, omitted action, "
                     "harmful implementation, or outdated ground truth."
                 ),
+                on_change=autosave_annotation,
+                args=autosave_args,
             )
+
+            if saved_key in st.session_state:
+                st.caption(f"Autosaved at {st.session_state[saved_key]}")
 
             if st.button(
                 "Save annotation",
