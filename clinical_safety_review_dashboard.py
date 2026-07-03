@@ -312,7 +312,7 @@ def save_annotation(
 
     new_row = [
         reviewer_key,
-        datetime.now().isoformat(timespec="seconds"),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         qid_key,
         model_key,
         clean_answer(row["ground_truth"]),
