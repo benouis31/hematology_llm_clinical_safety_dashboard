@@ -49,8 +49,12 @@ st.caption("Blinded clinician review of LLM failures in hematology MCQs")
 
 st.success(
     "Annotations are saved automatically after each change. "
-    "You can also click 'Save annotation' manually."
+    "You can also click 'Save annotation' manually or save all model outputs "
+    "for the current question."
 )
+
+if "last_save_message" in st.session_state:
+    st.success(st.session_state.pop("last_save_message"))
 
 
 # ============================================================
@@ -230,7 +234,13 @@ def save_annotation(
     consensus,
     comment,
 ):
-    """Save or overwrite an annotation in Google Sheets."""
+    """
+    Save or overwrite one annotation in Google Sheets.
+
+    One unique annotation = reviewer_id + QID + model.
+    If that row already exists, it is updated.
+    If it does not exist, a new row is appended.
+    """
     sheet = get_sheet()
     records = sheet.get_all_records()
 
@@ -295,6 +305,42 @@ def autosave_annotation(
     st.session_state[saved_key] = datetime.now().strftime("%H:%M:%S")
 
 
+def save_all_current_question(current_df: pd.DataFrame, reviewer_id: str) -> int:
+    """
+    Save all model annotations for the currently selected QID.
+
+    This saves all rows visible on the right panel, for example:
+    LLM-1, LLM-2, LLM-3, LLM-4 for the selected QID.
+    """
+    saved_count = 0
+
+    for _, row in current_df.sort_values("model").iterrows():
+        row_data = row.to_dict()
+
+        safety_key = f"safety_{row['QID']}_{row['model']}"
+        outdated_key = f"outdated_{row['QID']}_{row['model']}"
+        consensus_key = f"consensus_{row['QID']}_{row['model']}"
+        comment_key = f"comment_{row['QID']}_{row['model']}"
+
+        safety_rating = st.session_state.get(safety_key, SAFETY_LABELS[0])
+        outdated = st.session_state.get(outdated_key, False)
+        consensus = st.session_state.get(consensus_key, False)
+        comment = st.session_state.get(comment_key, "")
+
+        save_annotation(
+            row=row_data,
+            reviewer_id=reviewer_id,
+            safety_rating=safety_rating,
+            outdated=outdated,
+            consensus=consensus,
+            comment=comment,
+        )
+
+        saved_count += 1
+
+    return saved_count
+
+
 def get_existing_annotation(annotations, reviewer_id, qid, model):
     """Retrieve the most recent annotation for a reviewer/QID/model."""
     if annotations.empty:
@@ -338,11 +384,34 @@ reviewer_id = st.sidebar.text_input(
     help="Use a unique blinded reviewer ID, e.g. reviewer_freya.",
 )
 
+reviewer_id = reviewer_id.strip()
+
+if reviewer_id == "":
+    st.sidebar.error("Please enter a reviewer ID before starting.")
+    st.stop()
+
 uploaded_file = st.sidebar.file_uploader(
     "Upload review CSV",
     type=["csv"],
     help="Upload bsh_failure_review_table.csv",
 )
+
+
+# ============================================================
+# GOOGLE SHEET CONNECTION CHECK
+# ============================================================
+
+with st.sidebar.expander("Google Sheet connection", expanded=False):
+    try:
+        sheet = get_sheet()
+        st.success("Connected")
+        st.write(f"Worksheet: {sheet.title}")
+        st.write(f"Rows in sheet: {len(sheet.get_all_values())}")
+    except Exception as e:
+        st.error("Google Sheet connection failed.")
+        st.code(str(e))
+        st.stop()
+
 
 if uploaded_file is None:
     st.info(
@@ -623,4 +692,22 @@ with right:
                     consensus=consensus,
                     comment=comment,
                 )
-                st.success("Annotation saved permanently.")
+
+                st.session_state["last_save_message"] = (
+                    f"Saved annotation for QID {row['QID']} | {row['model']}."
+                )
+                st.rerun()
+
+    st.divider()
+
+    if st.button(
+        "Save all annotations for this question",
+        type="primary",
+        key=f"save_all_{selected_qid}",
+    ):
+        saved_count = save_all_current_question(current_df, reviewer_id)
+
+        st.session_state["last_save_message"] = (
+            f"Saved {saved_count} annotations for Question ID {selected_qid}."
+        )
+        st.rerun()
