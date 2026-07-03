@@ -31,8 +31,8 @@ REQUIRED_COLUMNS = {
 # https://docs.google.com/spreadsheets/d/1e0MGEdJAXGe3TwPz_JTu5rGR65Af4Q4tX_bMAFQqhVY/edit
 SPREADSHEET_ID = "1e0MGEdJAXGe3TwPz_JTu5rGR65Af4Q4tX_bMAFQqhVY"
 
-# This must match the tab name at the bottom of Google Sheets.
-WORKSHEET_NAME = "annotations"
+# Your Google Sheet URL ends with gid=0, so we write to that exact tab.
+WORKSHEET_GID = 0
 
 
 # ============================================================
@@ -47,10 +47,9 @@ st.set_page_config(
 st.title("Clinical Safety Review Dashboard")
 st.caption("Blinded clinician review of LLM failures in hematology MCQs")
 
-st.success(
-    "Annotations are saved automatically after each change. "
-    "You can also click 'Save annotation' manually or save all model outputs "
-    "for the current question."
+st.info(
+    "Annotations are not autosaved. After reviewing a question, click "
+    "'Save all annotations for this question'."
 )
 
 if "last_save_message" in st.session_state:
@@ -80,7 +79,19 @@ def get_sheet():
 
     client = gspread.authorize(creds)
 
-    return client.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+    try:
+        worksheet = spreadsheet.get_worksheet_by_id(WORKSHEET_GID)
+    except Exception:
+        worksheet = spreadsheet.get_worksheet(0)
+
+    if worksheet is None:
+        raise ValueError(
+            f"Could not find worksheet with gid={WORKSHEET_GID}."
+        )
+
+    return worksheet
 
 
 # ============================================================
@@ -124,14 +135,44 @@ def validate_data(df: pd.DataFrame):
         st.stop()
 
 
+def normalize_key(value) -> str:
+    """Normalize reviewer/model keys for matching duplicate rows."""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    return str(value).strip()
+
+
+def normalize_qid(value) -> str:
+    """Normalize QID for matching, e.g. 41878.0 -> 41878."""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    text = str(value).strip()
+
+    if re.fullmatch(r"\d+\.0", text):
+        return text[:-2]
+
+    return text
+
+
 def clean_answer(answer) -> str:
     """
     Normalize MCQ answers, preserving leading zeros and original order.
     Examples:
-        3.0         -> "3"
-        "0 1 2 4"   -> "0124"
-        "[0,1,2]"   -> "012"
-        NaN         -> ""
+        3.0          -> "3"
+        "0 1 2 4"    -> "0124"
+        "[0,1,2]"    -> "012"
+        NaN          -> ""
     """
     try:
         if pd.isna(answer):
@@ -163,7 +204,6 @@ def clean_answer(answer) -> str:
 def format_answer(answer) -> str:
     """
     Format a cleaned answer for display.
-    Handles "0", empty strings, and NaN safely.
     Single digit "0" -> "0".
     Multi-digit "023" -> "0 2 3".
     """
@@ -187,6 +227,16 @@ def safe_text(value) -> str:
         pass
 
     return str(value).strip()
+
+
+def to_sheet_bool(value) -> str:
+    """Write booleans consistently as TRUE/FALSE text."""
+    return "TRUE" if bool(value) else "FALSE"
+
+
+def parse_sheet_bool(value) -> bool:
+    """Read booleans robustly from Google Sheets."""
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
 def empty_annotation_table() -> pd.DataFrame:
@@ -222,7 +272,7 @@ def load_annotations(reviewer_id: str) -> pd.DataFrame:
         return empty_annotation_table()
 
     return df[
-        df["reviewer_id"].astype(str) == str(reviewer_id)
+        df["reviewer_id"].apply(normalize_key) == normalize_key(reviewer_id)
     ].copy()
 
 
@@ -237,80 +287,72 @@ def save_annotation(
     """
     Save or overwrite one annotation in Google Sheets.
 
-    One unique annotation = reviewer_id + QID + model.
-    If that row already exists, it is updated.
-    If it does not exist, a new row is appended.
+    Unique key:
+        reviewer_id + QID + model
+
+    If duplicates already exist for this key, the first one is updated
+    and the extra duplicate rows are deleted.
     """
     sheet = get_sheet()
     records = sheet.get_all_records()
 
-    row_exists = False
-    existing_row_number = None
+    reviewer_key = normalize_key(reviewer_id)
+    qid_key = normalize_qid(row["QID"])
+    model_key = normalize_key(row["model"])
+
+    matching_rows = []
 
     for idx, record in enumerate(records, start=2):
         if (
-            str(record.get("reviewer_id", "")) == str(reviewer_id)
-            and str(record.get("QID", "")) == str(row["QID"])
-            and str(record.get("model", "")) == str(row["model"])
+            normalize_key(record.get("reviewer_id", "")) == reviewer_key
+            and normalize_qid(record.get("QID", "")) == qid_key
+            and normalize_key(record.get("model", "")) == model_key
         ):
-            row_exists = True
-            existing_row_number = idx
-            break
+            matching_rows.append(idx)
 
     new_row = [
-        str(reviewer_id),
+        reviewer_key,
         datetime.now().isoformat(timespec="seconds"),
-        str(row["QID"]),
-        str(row["model"]),
+        qid_key,
+        model_key,
         clean_answer(row["ground_truth"]),
         clean_answer(row["prediction"]),
-        str(row["error_type"]),
+        normalize_key(row["error_type"]),
         safety_rating,
-        str(bool(outdated)),
-        str(bool(consensus)),
-        str(comment),
+        to_sheet_bool(outdated),
+        to_sheet_bool(consensus),
+        normalize_key(comment),
     ]
 
-    if row_exists:
-        cell_range = f"A{existing_row_number}:K{existing_row_number}"
-        sheet.update(cell_range, [new_row])
+    if matching_rows:
+        first_row = matching_rows[0]
+        cell_range = f"A{first_row}:K{first_row}"
+
+        sheet.update(
+            cell_range,
+            [new_row],
+            value_input_option="RAW",
+        )
+
+        # Delete duplicate rows for the same reviewer/QID/model.
+        # Delete from bottom to top so row numbers remain valid.
+        for duplicate_row in reversed(matching_rows[1:]):
+            sheet.delete_rows(duplicate_row)
+
     else:
-        sheet.append_row(new_row, value_input_option="USER_ENTERED")
-
-
-def autosave_annotation(
-    row,
-    reviewer_id,
-    safety_key,
-    outdated_key,
-    consensus_key,
-    comment_key,
-    saved_key,
-):
-    """Autosave annotation whenever the reviewer changes an input."""
-    safety_rating = st.session_state.get(safety_key, SAFETY_LABELS[0])
-    outdated = st.session_state.get(outdated_key, False)
-    consensus = st.session_state.get(consensus_key, False)
-    comment = st.session_state.get(comment_key, "")
-
-    save_annotation(
-        row=row,
-        reviewer_id=reviewer_id,
-        safety_rating=safety_rating,
-        outdated=outdated,
-        consensus=consensus,
-        comment=comment,
-    )
-
-    st.session_state[saved_key] = datetime.now().strftime("%H:%M:%S")
+        sheet.append_row(
+            new_row,
+            value_input_option="RAW",
+        )
 
 
 def save_all_current_question(current_df: pd.DataFrame, reviewer_id: str) -> int:
     """
     Save all model annotations for the currently selected QID.
 
-    This saves all rows visible on the right panel, for example:
-    LLM-1, LLM-2, LLM-3, LLM-4 for the selected QID.
+    Example:
+        If the selected QID has LLM-1, LLM-2, LLM-3, LLM-4,
+        this saves all four rows.
     """
     saved_count = 0
 
@@ -347,9 +389,9 @@ def get_existing_annotation(annotations, reviewer_id, qid, model):
         return None
 
     subset = annotations[
-        (annotations["reviewer_id"].astype(str) == str(reviewer_id))
-        & (annotations["QID"].astype(str) == str(qid))
-        & (annotations["model"].astype(str) == str(model))
+        (annotations["reviewer_id"].apply(normalize_key) == normalize_key(reviewer_id))
+        & (annotations["QID"].apply(normalize_qid) == normalize_qid(qid))
+        & (annotations["model"].apply(normalize_key) == normalize_key(model))
     ]
 
     if subset.empty:
@@ -365,9 +407,9 @@ def get_active_reviewers() -> list:
 
     return sorted(
         set(
-            str(r.get("reviewer_id", ""))
+            normalize_key(r.get("reviewer_id", ""))
             for r in all_records
-            if str(r.get("reviewer_id", "")).strip()
+            if normalize_key(r.get("reviewer_id", ""))
         )
     )
 
@@ -405,8 +447,9 @@ with st.sidebar.expander("Google Sheet connection", expanded=False):
     try:
         sheet = get_sheet()
         st.success("Connected")
-        st.write(f"Worksheet: {sheet.title}")
-        st.write(f"Rows in sheet: {len(sheet.get_all_values())}")
+        st.write(f"Worksheet title: {sheet.title}")
+        st.write(f"Worksheet ID / gid: {sheet.id}")
+        st.write(f"Rows in worksheet: {len(sheet.get_all_values())}")
     except Exception as e:
         st.error("Google Sheet connection failed.")
         st.code(str(e))
@@ -429,11 +472,11 @@ df = pd.read_csv(uploaded_file, dtype=str)
 df = normalize_columns(df)
 validate_data(df)
 
-df["QID"] = df["QID"].astype(str)
-df["model"] = df["model"].astype(str)
+df["QID"] = df["QID"].astype(str).str.strip()
+df["model"] = df["model"].astype(str).str.strip()
 df["ground_truth"] = df["ground_truth"].apply(clean_answer)
 df["prediction"] = df["prediction"].apply(clean_answer)
-df["error_type"] = df["error_type"].astype(str)
+df["error_type"] = df["error_type"].astype(str).str.strip()
 
 annotations = load_annotations(reviewer_id)
 
@@ -458,8 +501,8 @@ st.sidebar.download_button(
 
 reviewed_pairs = set(
     zip(
-        annotations["QID"].astype(str),
-        annotations["model"].astype(str),
+        annotations["QID"].apply(normalize_qid),
+        annotations["model"].apply(normalize_key),
     )
 )
 
@@ -507,8 +550,8 @@ current_df = df[df["QID"] == selected_qid].copy()
 
 current_pairs = set(
     zip(
-        current_df["QID"].astype(str),
-        current_df["model"].astype(str),
+        current_df["QID"].apply(normalize_qid),
+        current_df["model"].apply(normalize_key),
     )
 )
 
@@ -591,19 +634,19 @@ with right:
         )
 
         default_outdated = (
-            str(existing.get("ground_truth_outdated", "False")).lower() == "true"
+            parse_sheet_bool(existing.get("ground_truth_outdated", "FALSE"))
             if existing is not None
             else False
         )
 
         default_consensus = (
-            str(existing.get("needs_consensus_review", "False")).lower() == "true"
+            parse_sheet_bool(existing.get("needs_consensus_review", "FALSE"))
             if existing is not None
             else False
         )
 
         default_comment = (
-            str(existing.get("clinician_comment", ""))
+            safe_text(existing.get("clinician_comment", ""))
             if existing is not None
             else ""
         )
@@ -628,41 +671,24 @@ with right:
             outdated_key = f"outdated_{row['QID']}_{row['model']}"
             consensus_key = f"consensus_{row['QID']}_{row['model']}"
             comment_key = f"comment_{row['QID']}_{row['model']}"
-            saved_key = f"saved_{row['QID']}_{row['model']}"
-
-            autosave_args = (
-                row_data,
-                reviewer_id,
-                safety_key,
-                outdated_key,
-                consensus_key,
-                comment_key,
-                saved_key,
-            )
 
             safety_rating = st.selectbox(
                 "Safety rating",
                 SAFETY_LABELS,
                 index=SAFETY_LABELS.index(default_rating),
                 key=safety_key,
-                on_change=autosave_annotation,
-                args=autosave_args,
             )
 
             outdated = st.checkbox(
                 "Ground truth may be outdated / model partially correct",
                 value=default_outdated,
                 key=outdated_key,
-                on_change=autosave_annotation,
-                args=autosave_args,
             )
 
             consensus = st.checkbox(
                 "Needs consensus review",
                 value=default_consensus,
                 key=consensus_key,
-                on_change=autosave_annotation,
-                args=autosave_args,
             )
 
             comment = st.text_area(
@@ -673,15 +699,10 @@ with right:
                     "Explain potential patient harm, omitted action, "
                     "harmful implementation, or outdated ground truth."
                 ),
-                on_change=autosave_annotation,
-                args=autosave_args,
             )
 
-            if saved_key in st.session_state:
-                st.caption(f"Autosaved at {st.session_state[saved_key]}")
-
             if st.button(
-                "Save annotation",
+                "Save this model annotation",
                 key=f"save_{row['QID']}_{row['model']}",
             ):
                 save_annotation(
@@ -694,7 +715,8 @@ with right:
                 )
 
                 st.session_state["last_save_message"] = (
-                    f"Saved annotation for QID {row['QID']} | {row['model']}."
+                    f"Saved annotation for reviewer={reviewer_id}, "
+                    f"QID={row['QID']}, model={row['model']}."
                 )
                 st.rerun()
 
@@ -708,6 +730,7 @@ with right:
         saved_count = save_all_current_question(current_df, reviewer_id)
 
         st.session_state["last_save_message"] = (
-            f"Saved {saved_count} annotations for Question ID {selected_qid}."
+            f"Saved {saved_count} annotation rows for reviewer={reviewer_id}, "
+            f"Question ID={selected_qid}."
         )
         st.rerun()
