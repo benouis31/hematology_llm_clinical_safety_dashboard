@@ -27,7 +27,11 @@ REQUIRED_COLUMNS = {
     "error_type",
 }
 
-SHEET_NAME = "Clinical_Safety_Annotations"
+# Exact Google Sheet ID from your URL:
+# https://docs.google.com/spreadsheets/d/1e0MGEdJAXGe3TwPz_JTu5rGR65Af4Q4tX_bMAFQqhVY/edit
+SPREADSHEET_ID = "1e0MGEdJAXGe3TwPz_JTu5rGR65Af4Q4tX_bMAFQqhVY"
+
+# This must match the tab name at the bottom of Google Sheets.
 WORKSHEET_NAME = "annotations"
 
 
@@ -72,7 +76,7 @@ def get_sheet():
 
     client = gspread.authorize(creds)
 
-    return client.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
+    return client.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
 
 
 # ============================================================
@@ -273,10 +277,7 @@ def autosave_annotation(
     comment_key,
     saved_key,
 ):
-    """
-    Autosave annotation whenever the reviewer changes an input.
-    This uses the existing Google Sheets save_annotation() function.
-    """
+    """Autosave annotation whenever the reviewer changes an input."""
     safety_rating = st.session_state.get(safety_key, SAFETY_LABELS[0])
     outdated = st.session_state.get(outdated_key, False)
     consensus = st.session_state.get(consensus_key, False)
@@ -615,7 +616,7 @@ with right:
                 key=f"save_{row['QID']}_{row['model']}",
             ):
                 save_annotation(
-                    row=row,
+                    row=row_data,
                     reviewer_id=reviewer_id,
                     safety_rating=safety_rating,
                     outdated=outdated,
