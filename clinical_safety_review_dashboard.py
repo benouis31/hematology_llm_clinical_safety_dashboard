@@ -1,5 +1,6 @@
 from datetime import datetime
 import re
+import csv
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +18,20 @@ SAFETY_LABELS = [
     "Unsafe, major harm if omitted",
     "Unsafe, major harm if implemented",
     "Output correct / partially correct",
+]
+
+ANNOTATION_COLUMNS = [
+    "reviewer_id",
+    "timestamp",
+    "QID",
+    "model",
+    "ground_truth",
+    "prediction",
+    "error_type",
+    "safety_rating",
+    "ground_truth_outdated",
+    "needs_consensus_review",
+    "clinician_comment",
 ]
 
 REQUIRED_COLUMNS = {
@@ -78,7 +93,6 @@ def get_sheet():
     )
 
     client = gspread.authorize(creds)
-
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
 
     try:
@@ -167,11 +181,14 @@ def normalize_qid(value) -> str:
 
 def clean_answer(answer) -> str:
     """
-    Normalize MCQ answers, preserving leading zeros and original order.
+    Normalize MCQ answers while preserving leading zeros and original order.
+
     Examples:
         3.0          -> "3"
+        "3.0"        -> "3"
         "0 1 2 4"    -> "0124"
         "[0,1,2]"    -> "012"
+        "01234"      -> "01234"
         NaN          -> ""
     """
     try:
@@ -180,10 +197,18 @@ def clean_answer(answer) -> str:
     except (TypeError, ValueError):
         pass
 
+    if isinstance(answer, float) and answer.is_integer():
+        return str(int(answer))
+
     text = str(answer).strip()
 
     if text == "":
         return ""
+
+    # Important fix:
+    # Without this, "3.0" would be parsed as digits ["3", "0"] -> "30".
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
 
     digits = re.findall(r"\d", text)
 
@@ -240,35 +265,115 @@ def parse_sheet_bool(value) -> bool:
 
 
 def empty_annotation_table() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "reviewer_id",
-            "timestamp",
-            "QID",
-            "model",
-            "ground_truth",
-            "prediction",
-            "error_type",
-            "safety_rating",
-            "ground_truth_outdated",
-            "needs_consensus_review",
-            "clinician_comment",
-        ]
-    )
+    return pd.DataFrame(columns=ANNOTATION_COLUMNS)
+
+
+def ensure_annotation_header(sheet):
+    """
+    Ensure the Google Sheet has the expected header.
+
+    This is only used if the worksheet is empty.
+    It does not overwrite an existing sheet.
+    """
+    values = sheet.get_all_values()
+
+    if not values:
+        sheet.append_row(
+            ANNOTATION_COLUMNS,
+            value_input_option="RAW",
+        )
+
+
+def sheet_values_to_dataframe(sheet) -> pd.DataFrame:
+    """
+    Read Google Sheet values as raw strings.
+
+    Important:
+    Do NOT use sheet.get_all_records() here.
+    get_all_records() may auto-convert numeric-looking strings:
+        "01234" -> 1234
+    get_all_values() preserves the cell text.
+    """
+    ensure_annotation_header(sheet)
+
+    values = sheet.get_all_values()
+
+    if not values or len(values) < 2:
+        return empty_annotation_table()
+
+    headers = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+
+    cleaned_rows = []
+
+    for row in rows:
+        # Keep row numbers stable in the sheet, but ignore completely empty rows.
+        if not any(str(cell).strip() for cell in row):
+            continue
+
+        padded = row + [""] * max(0, len(headers) - len(row))
+        cleaned_rows.append(padded[:len(headers)])
+
+    if not cleaned_rows:
+        return empty_annotation_table()
+
+    df = pd.DataFrame(cleaned_rows, columns=headers)
+    df.columns = df.columns.str.strip()
+
+    # Guarantee expected annotation columns exist.
+    for col in ANNOTATION_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Keep these as text to preserve leading zeros.
+    for col in ["reviewer_id", "QID", "model", "ground_truth", "prediction"]:
+        df[col] = df[col].astype(str).str.strip()
+
+    return df[ANNOTATION_COLUMNS].copy()
+
+
+def sheet_records_with_row_numbers(sheet) -> list:
+    """
+    Return Google Sheet records as text, including the original sheet row number.
+
+    Used for updating/deleting existing annotation rows.
+    """
+    ensure_annotation_header(sheet)
+
+    values = sheet.get_all_values()
+
+    if not values or len(values) < 2:
+        return []
+
+    headers = [str(h).strip() for h in values[0]]
+    records = []
+
+    for sheet_row_number, row in enumerate(values[1:], start=2):
+        if not any(str(cell).strip() for cell in row):
+            continue
+
+        padded = row + [""] * max(0, len(headers) - len(row))
+        record = {
+            headers[i]: str(padded[i]).strip()
+            for i in range(len(headers))
+        }
+        record["_sheet_row_number"] = sheet_row_number
+        records.append(record)
+
+    return records
 
 
 def load_annotations(reviewer_id: str) -> pd.DataFrame:
-    """Load all annotations for a given reviewer from Google Sheets."""
+    """
+    Load all annotations for a given reviewer from Google Sheets.
+
+    Uses get_all_values() instead of get_all_records()
+    to preserve leading zeros in ground_truth and prediction.
+    """
     sheet = get_sheet()
-    records = sheet.get_all_records()
+    df = sheet_values_to_dataframe(sheet)
 
-    if not records:
-        return empty_annotation_table()
-
-    df = pd.DataFrame(records)
-    df.columns = df.columns.str.strip()
-
-    if "reviewer_id" not in df.columns:
+    if df.empty or "reviewer_id" not in df.columns:
         return empty_annotation_table()
 
     return df[
@@ -292,9 +397,13 @@ def save_annotation(
 
     If duplicates already exist for this key, the first one is updated
     and the extra duplicate rows are deleted.
+
+    Important:
+    The values are written with value_input_option='RAW'
+    so answer codes like '01234' are preserved as text.
     """
     sheet = get_sheet()
-    records = sheet.get_all_records()
+    records = sheet_records_with_row_numbers(sheet)
 
     reviewer_key = normalize_key(reviewer_id)
     qid_key = normalize_qid(row["QID"])
@@ -302,13 +411,13 @@ def save_annotation(
 
     matching_rows = []
 
-    for idx, record in enumerate(records, start=2):
+    for record in records:
         if (
             normalize_key(record.get("reviewer_id", "")) == reviewer_key
             and normalize_qid(record.get("QID", "")) == qid_key
             and normalize_key(record.get("model", "")) == model_key
         ):
-            matching_rows.append(idx)
+            matching_rows.append(record["_sheet_row_number"])
 
     new_row = [
         reviewer_key,
@@ -403,13 +512,16 @@ def get_existing_annotation(annotations, reviewer_id, qid, model):
 def get_active_reviewers() -> list:
     """Return sorted list of all reviewers who have submitted annotations."""
     sheet = get_sheet()
-    all_records = sheet.get_all_records()
+    df = sheet_values_to_dataframe(sheet)
+
+    if df.empty or "reviewer_id" not in df.columns:
+        return []
 
     return sorted(
         set(
-            normalize_key(r.get("reviewer_id", ""))
-            for r in all_records
-            if normalize_key(r.get("reviewer_id", ""))
+            normalize_key(x)
+            for x in df["reviewer_id"]
+            if normalize_key(x)
         )
     )
 
@@ -446,6 +558,7 @@ uploaded_file = st.sidebar.file_uploader(
 with st.sidebar.expander("Google Sheet connection", expanded=False):
     try:
         sheet = get_sheet()
+        ensure_annotation_header(sheet)
         st.success("Connected")
         st.write(f"Worksheet title: {sheet.title}")
         st.write(f"Worksheet ID / gid: {sheet.id}")
@@ -468,11 +581,18 @@ if uploaded_file is None:
 # LOAD DATA
 # ============================================================
 
-df = pd.read_csv(uploaded_file, dtype=str)
+# Important:
+# dtype=str and keep_default_na=False preserve values such as 01234.
+df = pd.read_csv(
+    uploaded_file,
+    dtype=str,
+    keep_default_na=False,
+)
+
 df = normalize_columns(df)
 validate_data(df)
 
-df["QID"] = df["QID"].astype(str).str.strip()
+df["QID"] = df["QID"].apply(normalize_qid)
 df["model"] = df["model"].astype(str).str.strip()
 df["ground_truth"] = df["ground_truth"].apply(clean_answer)
 df["prediction"] = df["prediction"].apply(clean_answer)
@@ -485,7 +605,12 @@ annotations = load_annotations(reviewer_id)
 # DOWNLOAD REVIEWER ANNOTATIONS
 # ============================================================
 
-csv_export = annotations.to_csv(index=False)
+# Quote all fields so downloaded CSV keeps values like "01234" more safely.
+# Still, for Excel, it is best to import the CSV and set columns as text.
+csv_export = annotations.to_csv(
+    index=False,
+    quoting=csv.QUOTE_ALL,
+)
 
 st.sidebar.download_button(
     label="Download my annotations",
