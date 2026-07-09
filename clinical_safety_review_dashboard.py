@@ -252,22 +252,76 @@ def empty_annotation_table() -> pd.DataFrame:
     return pd.DataFrame(columns=ANNOTATION_COLUMNS)
 
 
+def is_quota_error(error) -> bool:
+    """
+    Detect Google Sheets API quota / rate-limit errors.
+    """
+    text = str(error).lower()
+    return "429" in text or "quota" in text or "rate limit" in text
+
+
+def show_sheet_read_warning_once(error):
+    """
+    Show a non-blocking warning only once per Streamlit session.
+    This prevents the whole app from crashing when Google temporarily
+    blocks read requests.
+    """
+    if not st.session_state.get("sheet_read_warning_shown", False):
+        st.warning(
+            "Google Sheets read quota was temporarily exceeded. "
+            "Existing annotations/progress may not refresh immediately, "
+            "but saving can still work. Please wait a few minutes if this persists."
+        )
+        st.session_state["sheet_read_warning_shown"] = True
+
+
+def latest_annotation_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only the latest annotation for each reviewer_id + QID + model.
+
+    The app now saves in append-only mode to avoid expensive read-before-write
+    operations. Historical duplicate rows are kept in Google Sheets as an audit
+    trail, but only the latest row is used in the dashboard and downloads.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["_row_order"] = range(len(df))
+    df["_timestamp_dt"] = pd.to_datetime(
+        df.get("timestamp", ""),
+        errors="coerce",
+    )
+
+    df = df.sort_values(["_timestamp_dt", "_row_order"], na_position="first")
+
+    df = df.drop_duplicates(
+        subset=["reviewer_id", "QID", "model"],
+        keep="last",
+    )
+
+    df = df.drop(columns=["_row_order", "_timestamp_dt"], errors="ignore")
+    return df.reset_index(drop=True)
+
+
 # ============================================================
 # GOOGLE SHEET SAFE READ FUNCTIONS
 # ============================================================
 
-def get_annotation_values(sheet):
+@st.cache_data(ttl=60, show_spinner=False)
+def get_annotation_values(_sheet):
     """
     Read only annotation columns A:K.
+
+    Cached for 60 seconds to reduce Google Sheets API quota errors.
+    The leading underscore in _sheet tells Streamlit not to hash
+    the gspread worksheet object.
 
     Important:
     Do NOT use get_all_records().
     Do NOT use get_all_values() on the full worksheet.
-
-    This keeps values such as 01234 as displayed text and avoids
-    Google Sheets API errors from reading the whole sheet.
     """
-    values = sheet.get(
+    values = _sheet.get(
         "A:K",
         value_render_option="FORMATTED_VALUE",
     )
@@ -277,26 +331,13 @@ def get_annotation_values(sheet):
 
 def ensure_annotation_header(sheet):
     """
-    Ensure the annotation sheet has the expected header.
-    Only checks A1:K1.
+    No repeated header check.
+
+    The annotation sheet already has the correct header. Re-reading A1:K1
+    on every rerun can trigger Google Sheets API quota errors, especially
+    when several reviewers use the app at the same time.
     """
-    header = sheet.get(
-        "A1:K1",
-        value_render_option="FORMATTED_VALUE",
-    )
-
-    header_missing = (
-        not header
-        or not header[0]
-        or not any(str(cell).strip() for cell in header[0])
-    )
-
-    if header_missing:
-        sheet.update(
-            "A1:K1",
-            [ANNOTATION_COLUMNS],
-            value_input_option="RAW",
-        )
+    return
 
 
 def sheet_values_to_dataframe(sheet) -> pd.DataFrame:
@@ -374,19 +415,35 @@ def sheet_records_with_row_numbers(sheet) -> list:
 
 def load_annotations(reviewer_id: str) -> pd.DataFrame:
     sheet = get_sheet()
-    df = sheet_values_to_dataframe(sheet)
+
+    try:
+        df = sheet_values_to_dataframe(sheet)
+    except Exception as e:
+        if is_quota_error(e):
+            show_sheet_read_warning_once(e)
+            return empty_annotation_table()
+        raise
 
     if df.empty or "reviewer_id" not in df.columns:
         return empty_annotation_table()
 
-    return df[
+    reviewer_df = df[
         df["reviewer_id"].apply(normalize_key) == normalize_key(reviewer_id)
     ].copy()
+
+    return latest_annotation_rows(reviewer_df)
 
 
 def get_active_reviewers() -> list:
     sheet = get_sheet()
-    df = sheet_values_to_dataframe(sheet)
+
+    try:
+        df = sheet_values_to_dataframe(sheet)
+    except Exception as e:
+        if is_quota_error(e):
+            show_sheet_read_warning_once(e)
+            return []
+        raise
 
     if df.empty or "reviewer_id" not in df.columns:
         return []
@@ -398,6 +455,7 @@ def get_active_reviewers() -> list:
             if normalize_key(x)
         )
     )
+
 
 
 # ============================================================
@@ -413,38 +471,20 @@ def save_annotation(
     comment,
 ):
     """
-    Save or overwrite one annotation.
+    Save one annotation in append-only mode.
 
-    Unique key:
-        reviewer_id + QID + model
-
-    If duplicate rows already exist, the first row is updated and
-    extra duplicate rows are deleted.
-
-    Values are written with RAW so 01234 stays text.
+    This is the best option for multi-reviewer Streamlit use because it avoids
+    read-before-write operations, which were causing Google Sheets API 429
+    quota errors. If a reviewer saves the same QID/model more than once, the
+    latest timestamped row is used by the dashboard via latest_annotation_rows().
     """
     sheet = get_sheet()
-    records = sheet_records_with_row_numbers(sheet)
-
-    reviewer_key = normalize_key(reviewer_id)
-    qid_key = normalize_qid(row["QID"])
-    model_key = normalize_key(row["model"])
-
-    matching_rows = []
-
-    for record in records:
-        if (
-            normalize_key(record.get("reviewer_id", "")) == reviewer_key
-            and normalize_qid(record.get("QID", "")) == qid_key
-            and normalize_key(record.get("model", "")) == model_key
-        ):
-            matching_rows.append(record["_sheet_row_number"])
 
     new_row = [
-        reviewer_key,
+        normalize_key(reviewer_id),
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        qid_key,
-        model_key,
+        normalize_qid(row["QID"]),
+        normalize_key(row["model"]),
         clean_answer(row["ground_truth"]),
         clean_answer(row["prediction"]),
         normalize_key(row["error_type"]),
@@ -454,24 +494,10 @@ def save_annotation(
         normalize_key(comment),
     ]
 
-    if matching_rows:
-        first_row = matching_rows[0]
-        cell_range = f"A{first_row}:K{first_row}"
-
-        sheet.update(
-            cell_range,
-            [new_row],
-            value_input_option="RAW",
-        )
-
-        for duplicate_row in reversed(matching_rows[1:]):
-            sheet.delete_rows(duplicate_row)
-
-    else:
-        sheet.append_row(
-            new_row,
-            value_input_option="RAW",
-        )
+    sheet.append_row(
+        new_row,
+        value_input_option="RAW",
+    )
 
 
 def save_all_current_question(current_df: pd.DataFrame, reviewer_id: str) -> int:
@@ -552,12 +578,13 @@ uploaded_file = st.sidebar.file_uploader(
 with st.sidebar.expander("Google Sheet connection", expanded=False):
     try:
         sheet = get_sheet()
-        ensure_annotation_header(sheet)
 
         st.success("Connected")
         st.write(f"Worksheet title: {sheet.title}")
         st.write(f"Worksheet ID / gid: {sheet.id}")
-        st.write(f"Rows in annotation range A:K: {len(get_annotation_values(sheet))}")
+        st.caption(
+            "Sheet reads are cached for 60 seconds to avoid Google API quota errors."
+        )
 
     except Exception as e:
         st.error("Google Sheet connection failed.")
@@ -629,6 +656,10 @@ reviewed_count = len(reviewed_pairs)
 st.sidebar.metric(
     "Reviewed outputs",
     f"{reviewed_count} / {total_pairs}",
+)
+
+st.sidebar.caption(
+    "Progress and reviewer activity may refresh with up to 60 seconds delay."
 )
 
 
